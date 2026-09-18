@@ -1,0 +1,271 @@
+// Sales analytics warehouse -- PostgreSQL 17.
+//
+// Written against the real payload from https://datahub.ribshack.info/api/v1,
+// probed 18 Sep 2026. The README records what the probe found; the decisions
+// that shaped this file are repeated here, next to the columns they explain.
+//
+//   npm run migrate   -- create/apply a migration in development
+//   npm run deploy    -- apply existing migrations (no schema drift allowed)
+//
+// A separate database from `storehub_recon`. That one is the audited month-end
+// position and must not move; this is rebuildable from the API at any time.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Which estate a row belongs to. The API serves two unrelated businesses out of
+/// one table -- 19 `Ribshack ...` branches on StoreHub, and ~40 Alliance outlets
+/// whose sales arrive as a flat export. They share no transaction numbers.
+/// Every fact carries this so a report can show the group or either estate, and
+/// so a measure that only one feed can support is never silently averaged over
+/// both.
+enum Estate {
+  STOREHUB
+  ALLIANCE
+}
+
+model Store {
+  id       Int     @id @default(autoincrement())
+  sourceId String  @unique @map("source_id")
+  name     String
+  code     String?
+  estate   Estate
+  slug     String
+
+  /// Set where this branch is also converted by the storehub recon tool, so the
+  /// two systems can be tied out. Null means this branch is API-only.
+  reconName String? @map("recon_name")
+
+  transactions Transaction[]
+  receipts     Receipt[]
+
+  @@index([estate])
+  @@map("store")
+}
+
+model Product {
+  id       Int     @id @default(autoincrement())
+  sourceId String  @unique @map("source_id")
+  name     String
+  estate   Estate
+
+  lines TransactionItem[]
+
+  @@map("product")
+}
+
+model Transaction {
+  id Int @id @default(autoincrement())
+
+  /// The API's UUID. The ONLY safe key: `transactionId` (the receipt ref) is
+  /// not unique -- 333 collisions inside a single day on the Alliance feed.
+  /// Unique here is also what makes a re-load idempotent, which matters because
+  /// the API's date bounds are both inclusive, so adjacent windows overlap.
+  sourceId String @unique @map("source_id")
+
+  storeId Int    @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+  estate  Estate
+
+  /// Which of the three payload shapes this row arrived as. The estate alone is
+  /// not enough: the Alliance estate changed format in 2026, from a
+  /// line-level export (`Product ID`, `Qty`, `LineTotal`, one row per product)
+  /// to a sale-level one (`Account ID`, no products, no clock). A measure that
+  /// is valid on one shape is often meaningless on another, so the shape is
+  /// recorded rather than inferred from the date.
+  ///   storehub         -- nested items and payments, real times
+  ///   alliance_line    -- one row per product line, Oct 2025 to Apr 2026
+  ///   alliance_sale    -- one row per sale, no line detail, date only
+  feed String
+
+  /// The receipt / reference number as printed. Not unique -- see above.
+  refNumber String? @map("ref_number")
+
+  /// The trading day, in Manila local terms. Every daily figure keys on this.
+  businessDate DateTime @map("business_date") @db.Date
+
+  /// The true instant of sale, correct in UTC.
+  ///
+  /// The API's `transactionDate` is Manila wall-clock carrying a false `Z`
+  /// suffix -- it runs exactly 8 hours ahead of `rawData.storehub
+  /// .transactionTime`, which is the real UTC. Taking it at face value shifts
+  /// every sale 8 hours and moves evening trade into the following day. The
+  /// loader converts rather than trusting the suffix.
+  transactedAt DateTime? @map("transacted_at") @db.Timestamptz(3)
+
+  /// False for a row whose source carried a date but no clock -- July and
+  /// August 2026 are entirely date-only, about half the dataset. Hour-of-day
+  /// analysis must exclude these rather than treat them all as midnight, which
+  /// would invent a spike at 00:00 out of 767k rows.
+  hasTime Boolean @default(false) @map("has_time")
+
+  /// Hour 0-23 in Manila local time, null when hasTime is false. Denormalised
+  /// because every day-part query would otherwise repeat the same timezone
+  /// conversion over a million rows.
+  localHour Int? @map("local_hour")
+
+  amount   Decimal @db.Decimal(16, 2)
+  quantity Int     @default(1)
+
+  paymentMethod String? @map("payment_method")
+  cashierName   String? @map("cashier_name")
+
+  /// Kept verbatim from the feed, plus the API's own soft-delete and review
+  /// flags. Sales measures filter these out; the exceptions view is the one
+  /// place they are the subject. Nothing is deleted on load.
+  status     String?
+  isDeleted  Boolean @default(false) @map("is_deleted")
+  isFlagged  Boolean @default(false) @map("is_flagged")
+  flagReason String? @map("flag_reason")
+
+  // StoreHub-only detail. Null throughout on the Alliance feed.
+  channel        String?
+  registerId     String? @map("register_id")
+  terminalNumber String? @map("terminal_number")
+  invoiceNumber  String? @map("invoice_number")
+  employeeId     String? @map("employee_id")
+
+  subTotal       Decimal? @map("sub_total") @db.Decimal(16, 2)
+  taxAmount      Decimal? @map("tax_amount") @db.Decimal(16, 2)
+  discountAmount Decimal? @map("discount_amount") @db.Decimal(16, 2)
+  serviceCharge  Decimal? @map("service_charge") @db.Decimal(16, 2)
+  roundedAmount  Decimal? @map("rounded_amount") @db.Decimal(16, 2)
+
+  batchId   String?  @map("batch_id")
+  batchName String?  @map("batch_name")
+  sourceCreatedAt DateTime? @map("source_created_at") @db.Timestamptz(3)
+  loadedAt  DateTime @default(now()) @map("loaded_at")
+
+  items    TransactionItem[]
+  payments Payment[]
+
+  @@index([businessDate, storeId])
+  @@index([storeId, businessDate])
+  @@index([estate, businessDate])
+  @@index([localHour])
+  @@index([isFlagged, isDeleted])
+  @@index([feed])
+  @@map("transaction")
+}
+
+/// One line of a sale. Only the StoreHub feed carries these -- the Alliance
+/// sale-level export has no line detail at all, so basket analysis is
+/// answerable for the 19 Ribshack branches and not for the other 40.
+model TransactionItem {
+  id            Int         @id @default(autoincrement())
+  transactionId Int         @map("transaction_id")
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  /// The feed's own product id. StoreHub uses Mongo ObjectIds which the
+  /// /products endpoint does NOT cover, so `product` stays null for those until
+  /// names are mapped in from the recon tool's product exports. The id is kept
+  /// regardless, so a basket can be analysed by id before names exist.
+  productSourceId String  @map("product_source_id")
+  productId       Int?    @map("product_id")
+  product         Product? @relation(fields: [productId], references: [id])
+  productName     String? @map("product_name")
+
+  quantity  Decimal  @db.Decimal(12, 3)
+  unitPrice Decimal  @map("unit_price") @db.Decimal(16, 2)
+  subTotal  Decimal? @map("sub_total") @db.Decimal(16, 2)
+  taxAmount Decimal? @map("tax_amount") @db.Decimal(16, 2)
+  discount  Decimal  @default(0) @db.Decimal(16, 2)
+  lineTotal Decimal  @map("line_total") @db.Decimal(16, 2)
+  itemType  String?  @map("item_type")
+
+  @@index([transactionId])
+  @@index([productSourceId])
+  @@map("transaction_item")
+}
+
+model Payment {
+  id            Int         @id @default(autoincrement())
+  transactionId Int         @map("transaction_id")
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  method String
+  amount Decimal @db.Decimal(16, 2)
+
+  @@index([transactionId])
+  @@map("payment")
+}
+
+/// The BIR receipt register, from /receipts. A separate dataset, not a parent of
+/// `transaction`: it covers only the Alliance estate, only from Aug 2026, and
+/// its `receiptNumber` does not match any `refNumber` on the transaction side.
+/// It earns its own table because it is the only place the statutory discount
+/// breakdown lives -- and, via `time`, the only clock the Alliance estate has.
+model Receipt {
+  id       Int    @id @default(autoincrement())
+  sourceId String @unique @map("source_id")
+
+  storeId Int    @map("store_id")
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  receiptNumber  String?  @map("receipt_number")
+  businessDate   DateTime @map("business_date") @db.Date
+  /// As delivered: "1411" means 14:11. Kept raw alongside the parsed hour
+  /// because a malformed value should be visible, not silently dropped.
+  timeRaw        String?  @map("time_raw")
+  localHour      Int?     @map("local_hour")
+  terminalNumber String?  @map("terminal_number")
+  cashier        String?
+  servicedBy     String?  @map("serviced_by")
+  customerName   String?  @map("customer_name")
+  posted         Boolean  @default(false)
+
+  totalGross Decimal @map("total_gross") @db.Decimal(16, 2)
+  discount   Decimal @default(0) @db.Decimal(16, 2)
+  voidAmount Decimal @default(0) @map("void_amount") @db.Decimal(16, 2)
+  service    Decimal @default(0) @db.Decimal(16, 2)
+
+  // The statutory breakdown. These are the numbers BIR filings turn on, which
+  // is why each keeps its own column instead of being folded into `discount`.
+  senior       Decimal @default(0) @db.Decimal(16, 2)
+  pwd          Decimal @default(0) @db.Decimal(16, 2)
+  nac          Decimal @default(0) @db.Decimal(16, 2)
+  soloParent   Decimal @default(0) @map("solo_parent") @db.Decimal(16, 2)
+  mov          Decimal @default(0) @db.Decimal(16, 2)
+  diplomat     Decimal @default(0) @db.Decimal(16, 2)
+  evat         Decimal @default(0) @db.Decimal(16, 2)
+  tax          Decimal @default(0) @db.Decimal(16, 2)
+  localTax     Decimal @default(0) @map("local_tax") @db.Decimal(16, 2)
+  amusementTax Decimal @default(0) @map("amusement_tax") @db.Decimal(16, 2)
+  ewt          Decimal @default(0) @db.Decimal(16, 2)
+
+  feedbackRating  Int?      @map("feedback_rating")
+  batchId         String?   @map("batch_id")
+  sourceCreatedAt DateTime? @map("source_created_at") @db.Timestamptz(3)
+  loadedAt        DateTime  @default(now()) @map("loaded_at")
+
+  @@index([businessDate, storeId])
+  @@index([storeId, businessDate])
+  @@index([localHour])
+  @@map("receipt")
+}
+
+/// One row per window pulled, so a gap in coverage is a visible fact rather than
+/// a silently missing day on a chart.
+model LoadRun {
+  id        Int      @id @default(autoincrement())
+  dataset   String // transactions | receipts
+  fromDate  DateTime @map("from_date") @db.Date
+  toDate    DateTime @map("to_date") @db.Date
+  startedAt DateTime @default(now()) @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+
+  ok          Boolean @default(false)
+  rowsFetched Int     @default(0) @map("rows_fetched")
+  rowsWritten Int     @default(0) @map("rows_written")
+  apiTotal    Int?    @map("api_total")
+  error       String?
+
+  @@index([dataset, fromDate])
+  @@map("load_run")
+}

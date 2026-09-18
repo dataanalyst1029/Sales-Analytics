@@ -1,0 +1,11 @@
+.env
+db/.env
+samples/
+raw/
+__pycache__/
+*.pyc
+node_modules/
+
+# operational output -- row counts and timings, not deliverables
+*.log
+backfill.done

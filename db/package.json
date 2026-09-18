@@ -1,0 +1,19 @@
+{
+  "name": "sales-analytics-db",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prisma schema and migrations for the sales analytics warehouse (PostgreSQL 17)",
+  "scripts": {
+    "migrate": "prisma migrate dev",
+    "deploy": "prisma migrate deploy",
+    "status": "prisma migrate status",
+    "studio": "prisma studio",
+    "format": "prisma format"
+  },
+  "devDependencies": {
+    "prisma": "^6.2.1"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3"
+  }
+}
