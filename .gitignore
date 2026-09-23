@@ -8,4 +8,5 @@ node_modules/
 
 # operational output -- row counts and timings, not deliverables
 *.log
-backfill.done
+*.done
+

@@ -17,7 +17,7 @@ server without sharing a schema.
 recon UI run side by side. Binds to 127.0.0.1, so it is reachable from this PC
 only. Leave the console window open while you use it.
 
-Four views, one per question:
+Six views:
 
 | View | |
 |---|---|
@@ -25,6 +25,8 @@ Four views, one per question:
 | **Hours** | transactions and sales by hour, a day-of-week × hour heatmap, and cashier throughput |
 | **Products** | top products by value and by units, items per basket, average price |
 | **Exceptions** | flagged and soft-deleted rows, discounting by branch, and the BIR statutory relief — senior, PWD, solo parent, NAC — with voids |
+| **Alliance products** | Branch, Date, Product ID, Product Name, Qty, Gross Sales, %, Cost, Tax, Gross Profit, GP % — one row per branch per day per product, with a CSV download |
+| **StoreHub products** | Branch, Date, Product Name, Product Category, SKU ID, Total Items Sold, Total Sales, Total Sales Returned, Total Discount, Discount %, Item Net Sales, Average Cost, Average Net Sales, Gross Profit, Gross Profit % |
 
 Every view shares one From/To, estate and branch filter, and the selection
 travels with you: switching tabs, or using a quick-range chip, keeps the branches
@@ -42,6 +44,79 @@ bookmarked or pasted to someone else. An older single-branch link keeps working.
 Branches outside the chosen estate are dropped from the list rather than shown
 and ignored — ticking one while an estate filter is on would AND to nothing, and
 an empty dashboard with no explanation is the worst kind of answer.
+
+### Who can open it
+
+Out of the box the dashboard is open and bound to 127.0.0.1, so only this PC
+reaches it. To let other people in, turn on Google sign-in:
+
+```bash
+python setup_google.py
+```
+
+It walks through the Google Cloud console steps, prints the exact redirect URI to
+paste there, and asks for the client id, the client secret (hidden as you type)
+and at least one **admin email**. The secret goes straight into `.env`, which is
+gitignored; it is never echoed and never put on a command line.
+
+Once configured, every page requires a signed-in account:
+
+| Who | What they get |
+|---|---|
+| Not signed in | the sign-in page; every other path, including the CSVs and the analysis endpoint, redirects there |
+| New account | created **PENDING** — a holding page saying an administrator has been asked to approve them, and nothing else |
+| Approved | the dashboard |
+| Admin | the dashboard plus **Users**, with a count of who is waiting |
+| Rejected / suspended | told so plainly; signing in again does not reset it |
+
+An address in `ADMIN_EMAILS` is approved as ADMIN on its first sign-in. Without
+that nobody could approve anybody and the first person to install this would be
+locked out of their own dashboard.
+
+Approval is a real decision, not a formality: this dashboard shows the group's
+entire sales position, so the default for an unknown face is no. Every decision
+records who made it and when, and a rejected address that signs in again gets the
+same answer rather than a fresh PENDING row.
+
+Turning it off again with `python setup_google.py --off` reopens the dashboard
+but **keeps every account and approval**, so switching it back on restores
+exactly who had access.
+
+Two things worth knowing:
+
+- **The session cookie is HttpOnly, SameSite=Lax and HMAC-signed**, and lasts 12
+  hours. A tampered or unsigned cookie is rejected and lands on the sign-in page.
+- **Sign-in does not by itself expose the dashboard to the network** — see below.
+
+### Letting colleagues reach it
+
+```bash
+run_dashboard_network.cmd
+```
+
+That binds to every interface instead of 127.0.0.1, and prints the addresses
+people should type. **It refuses to start unless Google sign-in is configured**,
+because an open dashboard on the network publishes every branch's sales, costs
+and margins to anyone who can reach the port. That is a decision worth making on
+purpose, so it cannot be reached by typing a flag. (`--i-accept-no-sign-in`
+overrides it for a closed lab; it is deliberately undocumented in `--help`.)
+
+Windows Firewall will probably still block the port. If colleagues cannot
+connect, run this once from an **administrator** prompt — it is a change to your
+machine's security settings, so it is yours to make, not something this project
+does behind your back:
+
+```
+netsh advfirewall firewall add rule name="Sales Analytics 8001" dir=in action=allow protocol=TCP localport=8001
+```
+
+To start in network mode at every logon: `install_autostart.cmd network`.
+
+One thing to get right in the Google console: the **Authorised redirect URI** has
+to match the address people actually type, character for character. If everyone
+will use `http://your-pc-name:8001`, that is what goes in the console and what
+`setup_google.py` should be given as the base URL — not `localhost`. A mismatch
+shows up as `redirect_uri_mismatch` at sign-in.
 
 ### The analysis panels
 
@@ -100,11 +175,85 @@ Four things it deliberately will not do:
   group median gets named, alongside the legitimate explanations that look
   identical from here.
 
-**Keeping it current** — `run_daily_update.cmd` pulls the last 3 days. Safe to
-run as often as you like: rows upsert on the API's UUID, so a day already loaded
-is corrected rather than duplicated. Three days rather than one, so a
-late-posted or amended receipt is still caught. Point Task Scheduler at it to
-have it run itself.
+### The two product reports come from the API's own report endpoints
+
+Both product tabs read purpose-built endpoints, not anything derived from the
+raw transaction feed:
+
+| Tab | Endpoint | Rows | Carries |
+|---|---|---|---|
+| **Alliance products** | `/sales-summary` | 1,556,134 (Jan 2025 → Sep 2026) | product id, name, qty, gross sales, **cost, tax, gross profit** |
+| **StoreHub products** | `/storehub-product-movement` | 142,028 (Jan → Sep 2026) | **product category, SKU**, items sold, sales, returns, discount, net sales, average cost, gross profit |
+
+Both are loaded in full and tie exactly to the API's own totals, with 0 failed
+windows. The StoreHub tab matches the portal's own "StoreHub Product Movement"
+view row for row — 7,517 records for January 2026 on both sides, same figures to
+the centavo.
+
+`/sales-summary` reaches back to **January 2025**, nearly a year earlier than the
+transaction feed, so year-on-year comparison is possible on the Alliance side
+even though `/transactions` starts in October 2025. Assuming one source's
+coverage applies to another is the same mistake as assuming a guessed path list
+is the whole API — both cost a rebuild here.
+
+They land in their own tables, `sales_summary` and `product_movement`, loaded by
+`ingest_reports.py`. Kept separate from `transaction` deliberately: the grain is
+different — already aggregated to one row per branch, day and product — and the
+two sources must stay independently comparable, because disagreeing with each
+other is exactly the sort of thing worth noticing. The API even publishes its own
+`/reconciliation` endpoint that ties them together.
+
+```bash
+python ingest_reports.py --dataset both --recent 7
+python ingest_reports.py --status
+```
+
+**These endpoints were missed on the first pass**, and it cost real work. The
+discovery probe tried about thirty guessed paths, found six, and the reports were
+then built the hard way out of `/transactions` — which carries no cost, no tax
+and no category, so those columns were reported as impossible and a `costs.csv` /
+`products.csv` mechanism was built to supply them by hand. All of that is now
+deleted: the figures were in the API the whole time, on paths the probe's list
+did not contain (`/sales-summary`, `/sales-by-period`, `/sales-book`,
+`/storehub-product-movement`, `/reconciliation`, `/exports`).
+
+The lesson is in `probe_api.py`'s candidate list, which now includes them:
+a fixed list of guesses is a floor on what exists, never a ceiling. Where a
+portal shows a figure the API "does not have", the endpoint is the thing to go
+looking for.
+
+### Coverage is stated on the page
+
+Selecting 44 branches and seeing 4 in a report looks like a broken filter. Both
+product tabs now say which it is — how many branches in scope appear in this
+report, how many traded without appearing, and how many did not trade at all.
+
+### Two families of tab, two sources
+
+| | Reads | Named by |
+|---|---|---|
+| **Overview, Hours, Products, Exceptions** | `transaction`, `transaction_item`, `receipt` — receipt-level detail | `load_products.py` (Alliance SKUs) and `map_storehub_products.py` (StoreHub Mongo ids) |
+| **Alliance products, StoreHub products** | `sales_summary`, `product_movement` — the API's own daily reports | the endpoints themselves |
+
+The report endpoints supersede the CSV-lookup workarounds, **not** the two
+product-naming scripts. Those still name 1,799,890 of 1,817,554 line items, and
+without them the basket analysis, the product mix and "where the units went
+missing" would all show Mongo ids. Re-run them after a wider transaction
+backfill, or after a new recon conversion.
+
+**Keeping it current** — `run_daily_update.cmd` pulls the last 6 days of all
+four datasets: transactions, receipts, sales summary and product movement. Safe
+to run as often as you like, because every loader upserts on the API's own UUID —
+a day already loaded is corrected rather than duplicated. Six days rather than
+one, so a late-posted figure is caught and a couple of missed days catch
+themselves up.
+
+**Running itself** — `install_autostart.cmd` registers two Task Scheduler
+entries: the dashboard at logon, and the update at 06:30 daily. Both run as you,
+in your own session, needing no admin rights and touching nothing system-wide.
+`uninstall_autostart.cmd` removes them. Without this the dashboard stops at every
+reboot and the data quietly goes stale, which is how a working tool becomes a
+misleading one.
 
 **A wider load** — `python ingest.py --dataset both --from 2026-01-01 --to 2026-03-31`.
 `python ingest.py --status` says what is loaded and names any window that failed.
@@ -116,11 +265,19 @@ have it run itself.
 | `setup_env.py` | writes `.env`, proves the key against `/transactions`. Done. |
 | `api.py` | HTTP client — auth, retries, pagination. Done. |
 | `probe_api.py` | API shape discovery. Done. |
-| `db/prisma/schema.prisma` | 8 tables, migrated. Done. |
+| `db/prisma/schema.prisma` | 11 tables, migrated. Done. |
 | `ingest.py` | day-by-day idempotent loader for transactions and receipts. Done. |
+| `ingest_reports.py` | loader for `/sales-summary` and `/storehub-product-movement`. Done. |
 | `load_products.py` | the 440-SKU catalogue, linked to lines. Done. |
 | `map_storehub_products.py` | names the StoreHub product ids. Done. |
-| `analytics_web.py` | the four-view dashboard. Done. |
+| `insights.py` | the analysis panel behind every tab. Done. |
+| `auth.py` | Google sign-in, sessions, the approval gate. Done. |
+| `setup_google.py` | turns sign-in on; asks for the credentials. Done. |
+| `analytics_web.py` | the six-view dashboard. Done. |
+| `run_dashboard.cmd` | start the dashboard with a console window. |
+| `run_dashboard_quiet.cmd` | the same, windowless, for the scheduled task. |
+| `run_daily_update.cmd` | pull the last 6 days of all four datasets. |
+| `install_autostart.cmd` | dashboard at logon, update at 06:30. `uninstall_autostart.cmd` undoes it. |
 
 ### How the StoreHub products got their names
 

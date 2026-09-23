@@ -41,6 +41,12 @@ CANDIDATES = [
     '/products', '/items', '/menu',
     '/employees', '/staff', '/cashiers', '/users',
     '/payments', '/payment-methods',
+    # Report endpoints. These are the ones the first version of this list
+    # missed: the portal showed cost, tax and product category that
+    # /transactions does not carry, and the figures were on these paths all
+    # along. A guessed list is a floor on what exists, never a ceiling.
+    '/sales-summary', '/sales-by-period', '/sales-book', '/reconciliation',
+    '/storehub-product-movement', '/parent-products', '/exports',
 ]
 
 MAX_EXAMPLE = 60

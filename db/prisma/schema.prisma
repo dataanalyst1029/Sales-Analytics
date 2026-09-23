@@ -44,6 +44,8 @@ model Store {
 
   transactions Transaction[]
   receipts     Receipt[]
+  salesSummary SalesSummary[]
+  movements    ProductMovement[]
 
   @@index([estate])
   @@map("store")
@@ -268,4 +270,125 @@ model LoadRun {
 
   @@index([dataset, fromDate])
   @@map("load_run")
+}
+
+
+/// The API's own daily product summary for the Alliance estate, from
+/// `/sales-summary`. This is a purpose-built report endpoint, not something
+/// derived from `transaction` -- and unlike the raw transaction feed it carries
+/// cost, tax and gross profit, and covers every month and every branch rather
+/// than only the handful whose line-level spreadsheets were uploaded.
+///
+/// Kept as its own table rather than folded into `transaction`: the grain is
+/// different (one row per branch, day and product, already aggregated) and the
+/// two must stay independently comparable, since disagreeing with each other is
+/// exactly the kind of thing worth noticing.
+model SalesSummary {
+  id       Int    @id @default(autoincrement())
+  sourceId String @unique @map("source_id")
+
+  storeId Int   @map("store_id")
+  store   Store @relation(fields: [storeId], references: [id])
+
+  businessDate DateTime @map("business_date") @db.Date
+  productId    String?  @map("product_id")
+  productName  String   @map("product_name")
+
+  quantity    Decimal  @db.Decimal(16, 3)
+  grossSales  Decimal  @map("gross_sales") @db.Decimal(16, 2)
+  /// Null, not zero, where the source did not supply it -- a zero cost would
+  /// make gross profit equal gross sales and overstate every margin.
+  cost        Decimal? @db.Decimal(16, 2)
+  tax         Decimal? @db.Decimal(16, 2)
+  grossProfit Decimal? @map("gross_profit") @db.Decimal(16, 2)
+
+  batchId  String?  @map("batch_id")
+  loadedAt DateTime @default(now()) @map("loaded_at")
+
+  @@index([businessDate, storeId])
+  @@index([storeId, businessDate])
+  @@index([productName])
+  @@map("sales_summary")
+}
+
+/// The API's daily product movement for the StoreHub estate, from
+/// `/storehub-product-movement`. Column for column, this is the StoreHub
+/// back-office "Sales by Product" report -- including the product category and
+/// the real SKU, neither of which appears anywhere on the raw transaction feed.
+model ProductMovement {
+  id       Int    @id @default(autoincrement())
+  sourceId String @unique @map("source_id")
+
+  storeId Int   @map("store_id")
+  store   Store @relation(fields: [storeId], references: [id])
+
+  businessDate    DateTime @map("business_date") @db.Date
+  productName     String   @map("product_name")
+  productCategory String?  @map("product_category")
+  skuId           String?  @map("sku_id")
+
+  totalItemsSold     Decimal  @map("total_items_sold") @db.Decimal(16, 3)
+  totalSales         Decimal  @map("total_sales") @db.Decimal(16, 2)
+  totalSalesReturned Decimal  @default(0) @map("total_sales_returned") @db.Decimal(16, 2)
+  totalDiscount      Decimal  @default(0) @map("total_discount") @db.Decimal(16, 2)
+  discountPercent    Decimal? @map("discount_percent") @db.Decimal(9, 4)
+  itemNetSales       Decimal  @map("item_net_sales") @db.Decimal(16, 2)
+  averageCost        Decimal? @map("average_cost") @db.Decimal(16, 2)
+  averageNetSales    Decimal? @map("average_net_sales") @db.Decimal(16, 2)
+  grossProfit        Decimal? @map("gross_profit") @db.Decimal(16, 2)
+  grossProfitPercent Decimal? @map("gross_profit_percent") @db.Decimal(9, 4)
+
+  batchId  String?  @map("batch_id")
+  loadedAt DateTime @default(now()) @map("loaded_at")
+
+  @@index([businessDate, storeId])
+  @@index([storeId, businessDate])
+  @@index([productCategory])
+  @@index([skuId])
+  @@map("product_movement")
+}
+
+
+/// Who may open the dashboard. Nobody is admitted by signing in alone: a new
+/// Google account lands here as PENDING and sees only a holding page until an
+/// admin approves it. That is deliberate -- this tool shows the group's entire
+/// sales position, so the default for an unknown face is "no", and access is a
+/// decision somebody makes rather than a side effect of knowing the URL.
+model AppUser {
+  id Int @id @default(autoincrement())
+
+  /// Google's stable subject id. The email can change on a Workspace account;
+  /// this cannot, so it is what identifies the person across sign-ins.
+  googleSub String? @unique @map("google_sub")
+  email     String  @unique
+  name      String?
+  pictureUrl String? @map("picture_url")
+
+  status UserStatus @default(PENDING)
+  role   UserRole   @default(VIEWER)
+
+  requestedAt DateTime  @default(now()) @map("requested_at")
+  decidedAt   DateTime? @map("decided_at")
+  /// Email of the admin who approved or rejected, kept as text rather than a
+  /// relation so the record survives that admin's own account being removed.
+  decidedBy   String?   @map("decided_by")
+  lastLoginAt DateTime? @map("last_login_at")
+  loginCount  Int       @default(0) @map("login_count")
+
+  @@index([status])
+  @@map("app_user")
+}
+
+enum UserStatus {
+  PENDING
+  APPROVED
+  /// Kept rather than deleted: a rejected address that signs in again must get
+  /// the same answer, not a fresh PENDING row and another trip to the admin.
+  REJECTED
+  SUSPENDED
+}
+
+enum UserRole {
+  VIEWER
+  ADMIN
 }
