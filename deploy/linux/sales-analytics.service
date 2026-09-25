@@ -1,0 +1,57 @@
+# The dashboard, kept running by systemd.
+#
+# It listens on 127.0.0.1:8087 only -- nothing on the network can reach that
+# port directly. Nginx (nginx-sales-analytics.conf) is the only way in, and it
+# adds HTTPS. --behind-proxy makes the app refuse to start unless Google
+# sign-in and PUBLIC_BASE_URL are configured, exactly as --host 0.0.0.0 would.
+#
+#   sudo cp deploy/linux/sales-analytics.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sales-analytics
+#   journalctl -u sales-analytics -f          # its output
+#
+# Paths assume the repo at /opt/sales-analytics with a virtualenv in .venv,
+# run as a dedicated unprivileged user `salesapp`. Adjust if yours differ.
+
+[Unit]
+Description=Sales Analytics dashboard
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=salesapp
+Group=salesapp
+WorkingDirectory=/opt/sales-analytics
+ExecStart=/opt/sales-analytics/.venv/bin/python analytics_web.py --host 127.0.0.1 --port 8087 --behind-proxy --no-browser
+Restart=on-failure
+RestartSec=5
+# Unbuffered, so print() lines reach the journal as they happen.
+Environment=PYTHONUNBUFFERED=1
+# Load limits (see README "Staying up under load"): queries past 60 s are
+# cancelled; at most 8 requests work at once, the rest queue for 30 s.
+Environment=QUERY_TIMEOUT_SECONDS=60
+Environment=MAX_CONCURRENT_REQUESTS=8
+
+# Ceilings for the process itself. If the dashboard ever runs away, systemd
+# kills and restarts just the dashboard -- the server and its other systems
+# keep their memory and CPU. It normally uses well under 200 MB.
+MemoryMax=1G
+TasksMax=256
+CPUQuota=200%
+
+# Hardening: it reads its own files and talks to Postgres and Google, nothing
+# more. It never needs to write outside its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sales-analytics
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

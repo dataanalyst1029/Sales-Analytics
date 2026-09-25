@@ -1,0 +1,13 @@
+# Back up the warehouse every night at 02:00. Persistent: if the server was off
+# at 02:00, the backup runs as soon as it is back up.
+
+[Unit]
+Description=Nightly Sales Analytics database backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

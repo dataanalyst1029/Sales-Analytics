@@ -375,8 +375,31 @@ model AppUser {
   lastLoginAt DateTime? @map("last_login_at")
   loginCount  Int       @default(0) @map("login_count")
 
+  sessions AppSession[]
+
   @@index([status])
   @@map("app_user")
+}
+
+/// One signed-in browser. The cookie holds a random token; this row holds only
+/// its SHA-256, so a copy of this table cannot be replayed as a login. A cookie
+/// whose row is gone is refused -- which is what makes signing out real: delete
+/// the row and every copy of that cookie is dead, not just the browser's.
+model AppSession {
+  /// sha256 of the cookie's token, hex.
+  id         String   @id
+  userId     Int      @map("user_id")
+  user       AppUser  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now()) @map("created_at")
+  expiresAt  DateTime @map("expires_at")
+  /// Refreshed at most every few minutes, so browsing is not a write per click.
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+  /// Shown on the Account page so people can tell their devices apart.
+  userAgent  String?  @map("user_agent")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("app_session")
 }
 
 enum UserStatus {
