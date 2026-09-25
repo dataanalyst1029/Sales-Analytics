@@ -67,6 +67,17 @@ def configured():
     return bool(c['client_id'] and c['client_secret'] and c['secret'])
 
 
+def https_only(cfg=None):
+    """True when people reach this through HTTPS (e.g. behind Nginx).
+
+    The cookie is then marked Secure, so a browser never sends it over plain
+    http where anyone on the network path could read and replay it. Keyed off
+    PUBLIC_BASE_URL because the app itself only ever sees http from the proxy.
+    """
+    cfg = cfg or config()
+    return cfg['base'].lower().startswith('https://')
+
+
 def redirect_uri(host_header, cfg=None):
     """Where Google sends the browser back.
 
@@ -108,10 +119,6 @@ def _unsign(token, secret):
     return payload
 
 
-def make_session(email, secret):
-    return _sign({'email': email, 'exp': time.time() + SESSION_HOURS * 3600}, secret)
-
-
 def read_session(cookie_header, secret):
     for part in (cookie_header or '').split(';'):
         k, _, v = part.strip().partition('=')
@@ -120,10 +127,100 @@ def read_session(cookie_header, secret):
     return None
 
 
+# -- sessions ----------------------------------------------------------------
+#
+# Each signed-in browser is a row in app_session. The cookie carries a random
+# token; the row stores only its SHA-256. A cookie whose row is gone is refused,
+# so signing out -- one device or all of them -- takes effect immediately, on
+# every copy of that cookie, rather than when the cookie's 12 hours run out.
+
+USER_FIELDS = ('id', 'email', 'name', 'status', 'role', 'picture')
+
+#: last_seen_at is refreshed at most this often, so browsing is not a database
+#: write on every click.
+SEEN_EVERY = '5 minutes'
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_session(user, user_agent, secret):
+    """Open a session for this browser and return the cookie value."""
+    token = secrets.token_urlsafe(32)
+    with db() as c:
+        # Housekeeping rides along with each sign-in: expired rows are useless
+        # and would otherwise pile up forever.
+        c.execute('DELETE FROM app_session WHERE expires_at < now()')
+        c.execute("""INSERT INTO app_session (id, user_id, expires_at, user_agent)
+                     VALUES (%s, %s, now() + make_interval(hours => %s), %s)""",
+                  (_token_hash(token), user['id'], SESSION_HOURS,
+                   (user_agent or '')[:300] or None))
+        c.commit()
+    return _sign({'sid': token, 'exp': time.time() + SESSION_HOURS * 3600}, secret)
+
+
+def current_user(cookie_header, secret):
+    """The signed-in user, or None.
+
+    The cookie must be validly signed AND its session row must still exist and
+    be unexpired. The returned dict carries `session`, the row id, so the caller
+    can end this session or tell it apart from the user's others.
+    """
+    sess = read_session(cookie_header, secret)
+    if not sess or not sess.get('sid'):
+        return None               # also a cookie from before sessions existed
+    sid = _token_hash(sess['sid'])
+    with db() as c:
+        r = c.execute("""SELECT u.id, u.email, u.name, u.status::text, u.role::text,
+                                u.picture_url,
+                                s.last_seen_at < now() - interval '%s'
+                           FROM app_session s JOIN app_user u ON u.id = s.user_id
+                          WHERE s.id = %%s AND s.expires_at > now()""" % SEEN_EVERY,
+                      (sid,)).fetchone()
+        if not r:
+            return None
+        if r[6]:
+            c.execute('UPDATE app_session SET last_seen_at = now() WHERE id = %s',
+                      (sid,))
+            c.commit()
+    user = dict(zip(USER_FIELDS, r[:6]))
+    user['session'] = sid
+    return user
+
+
+def end_session(sid):
+    """Sign out this one browser."""
+    with db() as c:
+        c.execute('DELETE FROM app_session WHERE id = %s', (sid,))
+        c.commit()
+
+
+def end_other_sessions(user_id, keep_sid=None):
+    """Sign out every browser this user has, except `keep_sid` if given."""
+    with db() as c:
+        c.execute("""DELETE FROM app_session
+                      WHERE user_id = %s AND id IS DISTINCT FROM %s""",
+                  (user_id, keep_sid))
+        c.commit()
+
+
+def list_sessions(user_id):
+    """(id, created_at, last_seen_at, user_agent) of live sessions, newest use first."""
+    with db() as c:
+        return c.execute("""SELECT id, created_at, last_seen_at, user_agent
+                              FROM app_session
+                             WHERE user_id = %s AND expires_at > now()
+                             ORDER BY last_seen_at DESC""", (user_id,)).fetchall()
+
+
 # -- the user table ---------------------------------------------------------
 
 def db():
-    return psycopg.connect(database_url())
+    # These are single-row lookups on every page load. A hung database should
+    # fail them in seconds, not hold the request open indefinitely.
+    return psycopg.connect(database_url(), connect_timeout=10,
+                           options='-c statement_timeout=10000')
 
 
 def get_user(email):
@@ -135,7 +232,7 @@ def get_user(email):
                       (email,)).fetchone()
     if not r:
         return None
-    return dict(zip(('id', 'email', 'name', 'status', 'role', 'picture'), r))
+    return dict(zip(USER_FIELDS, r))
 
 
 def upsert_from_google(claims, admins):
@@ -196,6 +293,10 @@ def set_status(user_id, status, role, by_email):
                         SET status = %s::"UserStatus", role = %s::"UserRole",
                             decided_at = now(), decided_by = %s
                       WHERE id = %s""", (status, role, by_email, user_id))
+        # Rejecting or suspending someone also signs them out everywhere, so a
+        # cookie they already hold is dead even if they are later re-approved.
+        if status != 'APPROVED':
+            c.execute('DELETE FROM app_session WHERE user_id = %s', (user_id,))
         c.commit()
 
 

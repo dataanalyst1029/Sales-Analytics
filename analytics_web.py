@@ -284,12 +284,28 @@ def short(v):
     return '%.0f' % v
 
 
+#: Postgres cancels any dashboard query that runs longer than this, so one huge
+#: date range cannot tie up the database for everyone else.
+QUERY_TIMEOUT_S = int(os.environ.get('QUERY_TIMEOUT_SECONDS', 60))
+
+#: How many requests may be worked on at once. Each holds at most one database
+#: connection at a time, so this also caps the connections the dashboard can
+#: take from Postgres (whose default limit is 100). Extra requests wait their
+#: turn for up to QUEUE_WAIT_S, then get a "busy, try again" page rather than
+#: piling onto the database until it refuses everyone.
+MAX_BUSY = int(os.environ.get('MAX_CONCURRENT_REQUESTS', 8))
+QUEUE_WAIT_S = 30
+_busy = threading.BoundedSemaphore(MAX_BUSY)
+
+
 class DB:
     def __init__(self):
         self.url = database_url()
 
     def q(self, sql, args=()):
-        with psycopg.connect(self.url) as c:
+        with psycopg.connect(self.url, connect_timeout=10,
+                             options='-c statement_timeout=%d'
+                                     % (QUERY_TIMEOUT_S * 1000)) as c:
             return c.execute(sql, args).fetchall()
 
     def one(self, sql, args=()):
@@ -712,6 +728,56 @@ def admin_users_page(db, f, me):
               '<tr><td colspan="5" class="empty">Nobody has signed in yet.</td></tr>')
 
 
+def describe_device(ua):
+    """'Chrome on Windows' from a User-Agent string -- enough to tell your own
+    devices apart, not a fingerprint."""
+    ua = ua or ''
+    browser = next((name for key, name in (('Edg/', 'Edge'), ('OPR/', 'Opera'),
+                                           ('Firefox/', 'Firefox'),
+                                           ('Chrome/', 'Chrome'),
+                                           ('Safari/', 'Safari')) if key in ua),
+                   'Unknown browser')
+    system = next((name for key, name in (('Windows', 'Windows'),
+                                          ('Android', 'Android'),
+                                          ('iPhone', 'iPhone'), ('iPad', 'iPad'),
+                                          ('Mac OS X', 'Mac'), ('CrOS', 'ChromeOS'),
+                                          ('Linux', 'Linux')) if key in ua), '')
+    return '%s on %s' % (browser, system) if system else browser
+
+
+def account_page(me, done=''):
+    rows = auth.list_sessions(me['id'])
+    others = sum(1 for r in rows if r[0] != me['session'])
+    body = ''.join(
+        '<tr><td><strong>%s</strong>%s</td>'
+        '<td style="font-size:11.5px;color:var(--text-secondary)">%s</td>'
+        '<td style="font-size:11.5px;color:var(--text-secondary)">%s</td></tr>'
+        % (esc(describe_device(ua)),
+           ' <span class="badge b-APPROVED">this device</span>'
+           if sid == me['session'] else '',
+           created.strftime('%d %b %Y, %H:%M'), seen.strftime('%d %b, %H:%M'))
+        for sid, created, seen, ua in rows)
+    notice = 'Signed out of every other device.' if done == 'others' else ''
+    return """
+%s
+<div class="card">
+  <h2>Account</h2>
+  <p class="note">Signed in as <strong>%s</strong>. <em>Sign out</em> in the
+    header ends this device only. If you signed in on a shared or lost device,
+    end it from here.</p>
+  <div class="scroll"><table class="utable">
+    <thead><tr><th>Device</th><th>Signed in</th><th>Last active</th></tr></thead>
+    <tbody>%s</tbody>
+  </table></div>
+  <form method="post" action="/account" style="margin-top:14px">
+    <button class="mini" name="end" value="others"%s>Sign out of all other devices</button>
+    <button class="mini ghost" name="end" value="all">Sign out everywhere</button>
+  </form>
+</div>""" % ('<div class="warn">%s</div>' % esc(notice) if notice else '',
+             esc(me['email']), body,
+             '' if others else ' disabled title="No other devices are signed in"')
+
+
 def page(title, path, f, db, body, me=None):
     nav = ''.join(
         '<a href="%s?%s" class="%s">%s</a>'
@@ -725,7 +791,7 @@ def page(title, path, f, db, body, me=None):
     if me:
         pend = auth.pending_count() if me.get('role') == 'ADMIN' else 0
         who = ('<div class="who">%s<span>%s</span>'
-               '<a href="/logout">Sign out</a></div>'
+               '<a href="/account">Account</a><a href="/logout">Sign out</a></div>'
                % (('<a href="/admin/users">Users <span class="pill">%d</span></a>'
                    % pend) if pend else
                   ('<a href="/admin/users">Users</a>' if me.get('role') == 'ADMIN' else ''),
@@ -1512,12 +1578,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
+    def end_headers(self):
+        # On every response, errors included: no MIME sniffing, no framing by
+        # another site (the admin buttons must not be clickable through an
+        # invisible iframe), and no dashboard URLs leaking in Referer headers.
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'same-origin')
+        super().end_headers()
+
     def _cookie(self, value, hours):
         """HttpOnly so no page script can read it; SameSite=Lax so it survives
-        the redirect back from Google but is not sent from other sites."""
+        the redirect back from Google but is not sent from other sites; Secure
+        when the public address is https, so it never travels unencrypted."""
         return ('Set-Cookie',
-                'sa_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d'
-                % (value, hours * 3600))
+                'sa_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s'
+                % (value, hours * 3600, '; Secure' if auth.https_only() else ''))
 
     def _gate(self, path):
         """(user, response_sent).
@@ -1534,9 +1610,7 @@ class Handler(BaseHTTPRequestHandler):
         if not auth.configured():
             return None, False
 
-        cfg = auth.config()
-        sess = auth.read_session(self.headers.get('Cookie'), cfg['secret'])
-        me = auth.get_user(sess['email']) if sess else None
+        me = auth.current_user(self.headers.get('Cookie'), auth.config()['secret'])
 
         if path in OPEN_PATHS:
             return me, False
@@ -1591,15 +1665,21 @@ class Handler(BaseHTTPRequestHandler):
                     'That Google account gave no email address.'))
                 return True
             cookie = self._cookie(
-                auth.make_session(user['email'], auth.config()['secret']),
+                auth.create_session(user, self.headers.get('User-Agent'),
+                                    auth.config()['secret']),
                 auth.SESSION_HOURS)
             self._redirect('/' if user['status'] == 'APPROVED' else '/pending',
                            extra=(cookie,))
             return True
 
         if path == '/logout':
-            self._redirect('/login', extra=(('Set-Cookie',
-                'sa_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'),))
+            # Clearing the browser's cookie is not enough -- a copy of it would
+            # still work. Deleting the session row kills every copy of this
+            # browser's cookie. Other devices stay signed in; the Account page
+            # is where to end those.
+            if me:
+                auth.end_session(me['session'])
+            self._redirect('/login', extra=(self._cookie('', 0),))
             return True
 
         if path == '/pending':
@@ -1610,18 +1690,121 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    # -- keeping one request from hurting the rest --------------------------
+
+    #: A client that connects and then goes quiet is dropped after this many
+    #: seconds instead of holding a thread forever.
+    timeout = 60
+
+    def send_response(self, *a, **k):
+        # Remembered so an error after the reply has started is not answered
+        # with a second, garbled reply on top of the first.
+        self._responded = True
+        super().send_response(*a, **k)
+
+    def do_GET(self):
+        self._guarded(self._get)
+
     def do_POST(self):
+        self._guarded(self._post)
+
+    def _guarded(self, handler):
+        """Run one request so that nothing it does can take the server down.
+
+        At most MAX_BUSY requests work at once; the rest wait their turn. A
+        query past QUERY_TIMEOUT_S is cancelled by Postgres. Whatever goes
+        wrong, the user gets a plain page saying what to do, the full detail
+        goes to the log, and the server carries on serving everyone else.
+        """
+        self._responded = False
+        if not _busy.acquire(timeout=QUEUE_WAIT_S):
+            self._fail(503, 'The dashboard is busy',
+                       'Too many reports are being worked out at once. '
+                       'Wait a few seconds and reload the page.')
+            return
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass                        # the browser gave up; nobody to answer
+        except psycopg.errors.QueryCanceled:
+            self._fail(503, 'That took too long',
+                       'This view ran past the %d-second limit and was stopped '
+                       'so it could not slow the dashboard down for everyone '
+                       'else. Try a shorter date range or fewer branches.'
+                       % QUERY_TIMEOUT_S)
+        except psycopg.OperationalError:
+            self._log_failure()
+            self._fail(503, 'Database unavailable',
+                       'The dashboard could not reach its database. Nothing is '
+                       'lost -- try again in a minute.')
+        except Exception:
+            self._log_failure()
+            self._fail(500, 'That page failed',
+                       'Something went wrong building this page, and it has '
+                       'been logged. The rest of the dashboard is unaffected.')
+        finally:
+            _busy.release()
+
+    def _log_failure(self):
+        import traceback
+        sys.stderr.write('%s %s failed:\n%s' % (self.command, self.path,
+                                                traceback.format_exc()))
+        sys.stderr.flush()
+
+    def _fail(self, status, title, message):
+        if self._responded:
+            return                      # too late for a clean error page
+        if urllib.parse.urlsplit(self.path).path.startswith('/insights'):
+            # Fetched into a panel of an already-drawn page, not navigated to.
+            body = '<div class="empty">%s. %s</div>' % (esc(title), esc(message))
+        else:
+            body = shell(title, '<div class="card"><h1>%s</h1><p>%s</p>'
+                                '<a class="chip" href="">'
+                                'Try again</a> <a class="chip" href="/">Back to the '
+                                'dashboard</a></div>' % (esc(title), esc(message)))
+        extra = (('Retry-After', '10'),) if status == 503 else ()
+        try:
+            self._send(body, status, extra=extra)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _post(self):
         u = urllib.parse.urlsplit(self.path)
         path = u.path.rstrip('/') or '/'
         me, done = self._gate(path)
         if done:
             return
-        if path != '/admin/users' or not me or me['role'] != 'ADMIN':
+        allowed = ((path == '/account' and me) or
+                   (path == '/admin/users' and me and me['role'] == 'ADMIN'))
+        if not allowed:
             self.send_error(404, 'No such page')
             return
 
-        length = int(self.headers.get('Content-Length') or 0)
+        # The only forms are a couple of buttons: a few bytes. Refuse anything
+        # that claims to be large rather than reading it into memory.
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 65536:
+            self.send_error(413, 'Request too large')
+            return
         form = urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
+
+        if path == '/account':
+            which = (form.get('end') or [''])[0]
+            if which == 'others':
+                auth.end_other_sessions(me['id'], keep_sid=me['session'])
+                self._redirect('/account?done=others')
+            elif which == 'all':
+                auth.end_other_sessions(me['id'])
+                self._redirect('/login?msg=' + urllib.parse.quote(
+                    'You have been signed out on every device.'),
+                    extra=(self._cookie('', 0),))
+            else:
+                self._redirect('/account')
+            return
+
         # One button, one decision -- the name carries the verb and the value
         # carries the user id, so a malformed post does nothing rather than
         # something arbitrary.
@@ -1644,7 +1827,7 @@ class Handler(BaseHTTPRequestHandler):
                 break
         self._redirect('/admin/users')
 
-    def do_GET(self):
+    def _get(self):
         u = urllib.parse.urlsplit(self.path)
         path = u.path.rstrip('/') or '/'
 
@@ -1658,6 +1841,17 @@ class Handler(BaseHTTPRequestHandler):
             db = DB()
             f = Filters(db, urllib.parse.parse_qs(u.query))
             self._send(page('Users', path, f, db, admin_users_page(db, f, me), me))
+            return
+
+        if path == '/account':
+            if not me:                  # sign-in switched off: no account to show
+                self._redirect('/')
+                return
+            db = DB()
+            q = urllib.parse.parse_qs(u.query)
+            f = Filters(db, q)
+            self._send(page('Account', path, f, db,
+                            account_page(me, (q.get('done') or [''])[0]), me))
             return
 
         # The Opportunities analysis reads the whole range and can take seconds
@@ -1712,28 +1906,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, 'No such page')
             return
         title, fn = VIEWS[path]
-        try:
-            db = DB()
-            f = Filters(db, urllib.parse.parse_qs(u.query),
-                        BOUNDS_TABLE.get(path, 'transaction'))
-            if path in FORCED_ESTATE:
-                f.force_estate(db, FORCED_ESTATE[path])
-            if f.data_lo is None:
-                body = ('<div class="card"><div class="empty">The warehouse is empty. '
-                        'Run <code>python ingest.py --dataset both --recent 7</code> '
-                        'first.</div></div>')
-                out = page(title, path, f, db, body, me)
-            else:
-                out = page(title, path, f, db, fn(db, f), me)
-            status = 200
-        except Exception:
-            import traceback
-            out = ('<!doctype html><meta charset="utf-8"><style>%s</style>'
-                   '<main><div class="card"><h2>That page failed</h2><pre>%s</pre>'
-                   '</div></main>' % (CSS, esc(traceback.format_exc()[-3000:])))
-            status = 500
+        # A failure here is answered by _guarded: a plain error page for the
+        # user, the traceback to the log -- never the traceback to the browser,
+        # which would show SQL and file paths to anyone who can sign in.
+        db = DB()
+        f = Filters(db, urllib.parse.parse_qs(u.query),
+                    BOUNDS_TABLE.get(path, 'transaction'))
+        if path in FORCED_ESTATE:
+            f.force_estate(db, FORCED_ESTATE[path])
+        if f.data_lo is None:
+            body = ('<div class="card"><div class="empty">The warehouse is empty. '
+                    'Run <code>python ingest.py --dataset both --recent 7</code> '
+                    'first.</div></div>')
+            out = page(title, path, f, db, body, me)
+        else:
+            out = page(title, path, f, db, fn(db, f), me)
         raw = out.encode('utf-8')
-        self.send_response(status)
+        self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(raw)))
         self.end_headers()
@@ -1765,18 +1954,37 @@ def main():
     ap.add_argument('--host', default='127.0.0.1',
                     help='0.0.0.0 to accept connections from the network. '
                          'Requires Google sign-in to be configured first.')
+    ap.add_argument('--behind-proxy', action='store_true',
+                    help='a reverse proxy (Nginx) publishes this to the network. '
+                         'Listens on --host as usual, but is held to the same '
+                         'rules as --host 0.0.0.0: sign-in and PUBLIC_BASE_URL '
+                         'are required.')
     ap.add_argument('--i-accept-no-sign-in', action='store_true',
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
 
-    network = a.host not in ('127.0.0.1', 'localhost', '::1')
+    # Behind a proxy the socket is 127.0.0.1, but the audience is the network.
+    network = a.behind_proxy or a.host not in ('127.0.0.1', 'localhost', '::1')
+
+    if a.behind_proxy and not auth.config()['base']:
+        print('Refusing to start behind a proxy without PUBLIC_BASE_URL.')
+        print('')
+        print('It fixes the Google redirect to the real address instead of')
+        print('trusting whatever Host header arrives, and an https:// value')
+        print('marks the session cookie Secure. Set it in .env, e.g.')
+        print('')
+        print('    PUBLIC_BASE_URL=https://sales.example.com')
+        print('')
+        print('(python setup_google.py asks for it.)')
+        return 2
 
     # Serving this to the network without sign-in publishes every branch's
     # sales, costs and margins to anyone who can reach the port. That is a
     # decision someone should make on purpose, so it cannot be arrived at by
     # typing a flag: the server refuses, and says how to fix it properly.
     if network and not auth.configured() and not a.i_accept_no_sign_in:
-        print('Refusing to listen on %s with sign-in switched off.' % a.host)
+        print('Refusing to listen on %s with sign-in switched off.'
+              % ('the network (behind a proxy)' if a.behind_proxy else a.host))
         print('')
         print('Anyone who could reach this port would see every branch, every')
         print('figure and every margin, with no login at all.')
@@ -1794,7 +2002,15 @@ def main():
     local = 'http://localhost:%d/' % a.port
     print('Sales analytics on %s' % local)
 
-    if network:
+    if a.behind_proxy:
+        print('Published by the reverse proxy as %s/' % auth.config()['base'])
+        print('Sign-in is on. New accounts land as PENDING until approved.')
+        if not auth.https_only():
+            print('')
+            print('*** PUBLIC_BASE_URL is plain http: sales figures and the session')
+            print('    cookie cross the network unencrypted. Put a certificate on')
+            print('    the proxy and change it to https://. ***')
+    elif network:
         host, ips = lan_addresses()
         print('Also reachable from the network as:')
         for ip in ips:

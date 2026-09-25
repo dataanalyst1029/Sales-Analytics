@@ -86,6 +86,16 @@ Two things worth knowing:
 
 - **The session cookie is HttpOnly, SameSite=Lax and HMAC-signed**, and lasts 12
   hours. A tampered or unsigned cookie is rejected and lands on the sign-in page.
+  **Signing out is real, not just a cleared cookie.** Every signed-in browser is
+  a row in `app_session` (holding only a SHA-256 of the cookie's token), and a
+  cookie whose row is gone is refused. *Sign out* ends this device only;
+  **Account** in the header lists your signed-in devices and has *Sign out of
+  all other devices* and *Sign out everywhere*. Being rejected or suspended
+  ends all of a user's sessions. Expired rows are cleared on each sign-in.
+  When `PUBLIC_BASE_URL` is `https://…` it is also marked **Secure**, so the
+  browser never sends it over plain http. Every response carries
+  `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: same-origin`.
 - **Sign-in does not by itself expose the dashboard to the network** — see below.
 
 ### Letting colleagues reach it
@@ -117,6 +127,94 @@ to match the address people actually type, character for character. If everyone
 will use `http://your-pc-name:8001`, that is what goes in the console and what
 `setup_google.py` should be given as the base URL — not `localhost`. A mismatch
 shows up as `redirect_uri_mismatch` at sign-in.
+
+### Deploying on a Linux server
+
+On a server the dashboard should not face the network itself. It listens on
+`127.0.0.1:8087`, and Nginx in front of it is the only way in — adding HTTPS,
+so sales figures and the session cookie are never sent unencrypted.
+
+```
+browser ──https:443──▶ Nginx ──http──▶ 127.0.0.1:8087  analytics_web.py ──▶ PostgreSQL
+```
+
+Everything needed is in `deploy/linux/`:
+
+| File | What it does |
+|---|---|
+| `sales-analytics.service` | systemd unit: runs the dashboard on 127.0.0.1:8087 with `--behind-proxy`, restarts it on failure, as an unprivileged `salesapp` user |
+| `nginx-sales-analytics.conf` | HTTPS on 443, http→https redirect, HSTS, proxies to 8087 |
+| `backup_db.sh` | compressed `pg_dump` of the warehouse, keeps 30 days |
+| `sales-analytics-backup.service` / `.timer` | runs the backup nightly at 02:00 |
+
+In order, on the server:
+
+```bash
+# 1. Code, an unprivileged user, and a virtualenv
+sudo useradd --system --home /opt/sales-analytics --shell /usr/sbin/nologin salesapp
+sudo git clone https://github.com/dataanalyst1029/Sales-Analytics /opt/sales-analytics
+cd /opt/sales-analytics
+sudo python3 -m venv .venv
+sudo .venv/bin/pip install psycopg[binary] requests
+#    then copy in .env and db/.env (never committed), and:
+sudo chown -R salesapp:salesapp /opt/sales-analytics
+sudo chmod 600 .env db/.env
+
+# 1b. Database tables -- also re-run after every git pull that adds a migration.
+#     The dashboard will not sign anyone in against an out-of-date schema.
+cd db && sudo -u salesapp npm ci && sudo -u salesapp npx prisma migrate deploy && cd ..
+
+# 2. Sign-in, with the https address people will type -- no port
+sudo -u salesapp .venv/bin/python setup_google.py
+#    Base URL: https://sales.example.com
+#    Google console redirect URI: https://sales.example.com/auth/callback
+
+# 3. The dashboard
+sudo cp deploy/linux/sales-analytics.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sales-analytics
+
+# 4. Nginx -- edit the server name and certificate paths first
+sudo cp deploy/linux/nginx-sales-analytics.conf /etc/nginx/conf.d/sales-analytics.conf
+sudo nginx -t && sudo systemctl reload nginx
+
+# 5. Nightly backups
+sudo mkdir -p /var/backups/sales-analytics
+sudo chown salesapp:salesapp /var/backups/sales-analytics
+sudo cp deploy/linux/sales-analytics-backup.* /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sales-analytics-backup.timer
+sudo systemctl start sales-analytics-backup      # once now, to prove it works
+```
+
+Open 443 (and 80, for the redirect) in the server firewall — **not** 8087:
+`sudo ufw allow 443/tcp && sudo ufw allow 80/tcp`, or on RHEL-family
+`sudo firewall-cmd --permanent --add-service=https --add-service=http && sudo firewall-cmd --reload`.
+
+`--behind-proxy` refuses to start unless Google sign-in **and**
+`PUBLIC_BASE_URL` are set: the socket is 127.0.0.1, but the audience is the
+network, so it is held to the same rule as `--host 0.0.0.0`. `PUBLIC_BASE_URL`
+also pins the Google redirect to the real address instead of trusting whatever
+`Host` header arrives, and an `https://` value is what marks the cookie Secure.
+
+**Staying up under load.** No single request, user or query can take the
+dashboard down for everyone else:
+
+| Layer | Limit | What the user sees past it |
+|---|---|---|
+| Nginx | 5 requests/s per visitor (burst 20), 10 connections per visitor | `429` — slow down |
+| App | at most `MAX_CONCURRENT_REQUESTS` (8) requests working at once; the rest queue for 30 s | "The dashboard is busy — reload" |
+| Postgres | any query past `QUERY_TIMEOUT_SECONDS` (60) is cancelled | "That took too long — try a shorter date range" |
+| App | database unreachable, or any bug in a page | a plain error page; the traceback goes to `journalctl -u sales-analytics`, never to the browser |
+| systemd | 1 GB memory, 256 threads, 2 CPUs | the dashboard alone is restarted within 5 s; the server is untouched |
+
+Eight at once also means the dashboard never holds more than eight Postgres
+connections, well inside the default limit of 100. Raise both environment values
+in the service file if many people use it at the same time.
+
+**Backups.** Nothing in this system deletes sales history, so the database is
+the only copy of it. `backup_db.sh` keeps 30 nightly dumps in
+`/var/backups/sales-analytics` (`KEEP_DAYS` to change it). Copy that directory
+off the server as well. Restore with
+`pg_restore --clean --if-exists -d "<DATABASE_URL>" <file>.dump`.
 
 ### The analysis panels
 

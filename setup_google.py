@@ -116,6 +116,7 @@ def main():
     print('\n1. Where will people open this dashboard?')
     print('   Just you, on this PC          ->  press Enter')
     print('   Others on the office network  ->  http://<this-pc-name>:%s' % a.port)
+    print('   A server behind Nginx + HTTPS ->  https://<server-name>   (no port)')
     got = input('\n   Base URL [http://localhost:%s]: ' % a.port).strip().rstrip('/')
     base = got or ''
     shown = base or 'http://localhost:%s' % a.port

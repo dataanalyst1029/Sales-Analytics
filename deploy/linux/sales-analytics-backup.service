@@ -1,0 +1,18 @@
+# One run of backup_db.sh. Started daily by sales-analytics-backup.timer.
+#
+#   sudo cp deploy/linux/sales-analytics-backup.* /etc/systemd/system/
+#   sudo mkdir -p /var/backups/sales-analytics
+#   sudo chown salesapp:salesapp /var/backups/sales-analytics
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sales-analytics-backup.timer
+#   sudo systemctl start sales-analytics-backup     # test it once now
+
+[Unit]
+Description=Sales Analytics database backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=salesapp
+Group=salesapp
+ExecStart=/bin/sh /opt/sales-analytics/deploy/linux/backup_db.sh
